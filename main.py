@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pythonjsonlogger import jsonlogger
-from telethon import TelegramClient, functions, types, utils
+from telethon import TelegramClient, events, functions, types, utils
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     User,
@@ -74,6 +74,11 @@ if SESSION_STRING:
 else:
     # Use file-based session
     client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+
+# Watcher state — in-memory queue for monitored user messages
+_watched_users: Dict[int, dict] = {}  # user_id → {chat_id, added_at, label}
+_watched_messages: list = []  # [{user_id, chat_id, message_id, text, date, sender_name}]
+_watcher_handler = None  # Reference to event handler for cleanup
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -4227,6 +4232,165 @@ async def reorder_folders(folder_ids: List[int]) -> str:
         return log_and_format_error(
             "reorder_folders", e, ErrorCategory.FOLDER, folder_ids=folder_ids
         )
+
+
+async def _on_watched_message(event):
+    """Internal handler for watched user messages."""
+    sender_id = event.sender_id
+    if sender_id not in _watched_users:
+        return
+
+    watch_config = _watched_users[sender_id]
+    # If chat_id filter is set, only capture from that chat
+    if watch_config.get("chat_id") and event.chat_id != watch_config["chat_id"]:
+        return
+
+    sender = await event.get_sender()
+    sender_name = getattr(sender, "first_name", "Unknown") or "Unknown"
+
+    _watched_messages.append({
+        "user_id": sender_id,
+        "chat_id": event.chat_id,
+        "message_id": event.message.id,
+        "text": event.message.text or "",
+        "date": event.message.date.isoformat() if event.message.date else None,
+        "sender_name": sender_name,
+    })
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Watch User", readOnlyHint=False))
+@auto_reconnect
+@validate_id("user_id", "chat_id")
+async def watch_user(
+    user_id: Union[int, str], chat_id: Union[int, str] = None, label: str = None
+) -> str:
+    """
+    Start watching for new messages from a specific user.
+    Messages are accumulated in an in-memory queue and can be retrieved with check_watched_messages.
+
+    Args:
+        user_id: The ID or username of the user to watch.
+        chat_id: Optional chat ID to filter — only capture messages from this chat.
+        label: Optional label for this watcher (e.g. "Tolik response").
+    """
+    global _watcher_handler
+    try:
+        entity = await client.get_entity(user_id)
+        resolved_id = entity.id
+        name = getattr(entity, "first_name", None) or getattr(entity, "title", "Unknown")
+
+        _watched_users[resolved_id] = {
+            "chat_id": chat_id,
+            "added_at": datetime.now().isoformat(),
+            "label": label or name,
+            "name": name,
+        }
+
+        # Register event handler if this is the first watcher
+        if _watcher_handler is None:
+            _watcher_handler = client.add_event_handler(
+                _on_watched_message, events.NewMessage()
+            )
+
+        chat_filter = f" in chat {chat_id}" if chat_id else " in all chats"
+        return f"Now watching {name} (ID: {resolved_id}){chat_filter}. Use check_watched_messages to retrieve new messages."
+    except Exception as e:
+        return log_and_format_error("watch_user", e, user_id=user_id)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Unwatch User", readOnlyHint=False))
+@auto_reconnect
+@validate_id("user_id")
+async def unwatch_user(user_id: Union[int, str]) -> str:
+    """
+    Stop watching a user. Remove event handler if no more watched users.
+
+    Args:
+        user_id: The ID or username of the user to stop watching.
+    """
+    global _watcher_handler
+    try:
+        entity = await client.get_entity(user_id)
+        resolved_id = entity.id
+
+        if resolved_id not in _watched_users:
+            return f"User {resolved_id} is not being watched."
+
+        name = _watched_users[resolved_id].get("name", "Unknown")
+        del _watched_users[resolved_id]
+
+        # Remove handler if no more watchers
+        if not _watched_users and _watcher_handler is not None:
+            client.remove_event_handler(_watcher_handler)
+            _watcher_handler = None
+
+        return f"Stopped watching {name} (ID: {resolved_id})."
+    except Exception as e:
+        return log_and_format_error("unwatch_user", e, user_id=user_id)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Check Watched Messages", readOnlyHint=True))
+@auto_reconnect
+@validate_id("user_id")
+async def check_watched_messages(
+    user_id: Union[int, str] = None, keep: bool = False
+) -> str:
+    """
+    Get accumulated messages from watched users. Clears queue by default.
+
+    Args:
+        user_id: Optional — filter messages by this user only.
+        keep: If True, don't clear messages after reading (default: False).
+    """
+    global _watched_messages
+    try:
+        if not _watched_messages:
+            return "No new messages from watched users."
+
+        if user_id is not None:
+            # Resolve user_id if it's a username
+            if isinstance(user_id, str) and not user_id.lstrip("-").isdigit():
+                entity = await client.get_entity(user_id)
+                user_id = entity.id
+
+            filtered = [m for m in _watched_messages if m["user_id"] == user_id]
+            if not keep:
+                _watched_messages = [m for m in _watched_messages if m["user_id"] != user_id]
+        else:
+            filtered = list(_watched_messages)
+            if not keep:
+                _watched_messages = []
+
+        if not filtered:
+            return "No new messages from watched users."
+
+        lines = []
+        for msg in filtered:
+            lines.append(
+                f"[{msg['date']}] {msg['sender_name']} (chat:{msg['chat_id']}, msg:{msg['message_id']}): {msg['text']}"
+            )
+        return f"{len(filtered)} message(s):\n" + "\n".join(lines)
+    except Exception as e:
+        return log_and_format_error("check_watched_messages", e)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="List Watched Users", readOnlyHint=True))
+@auto_reconnect
+async def list_watched_users() -> str:
+    """Show all currently watched users."""
+    try:
+        if not _watched_users:
+            return "No users are currently being watched."
+
+        lines = []
+        for uid, config in _watched_users.items():
+            chat_filter = f", chat: {config['chat_id']}" if config.get("chat_id") else ", all chats"
+            lines.append(
+                f"ID: {uid}, Name: {config.get('name', 'Unknown')}, Label: {config.get('label', '-')}{chat_filter}, Since: {config.get('added_at', '?')}"
+            )
+        return f"{len(_watched_users)} watched user(s):\n" + "\n".join(lines)
+    except Exception as e:
+        return log_and_format_error("list_watched_users", e)
 
 
 async def _main() -> None:
