@@ -24,6 +24,14 @@ _patcher_session = patch("telethon.sessions.StringSession", return_value=MagicMo
 _patcher_client.start()
 _patcher_session.start()
 
+# Ensure worktree's main.py takes priority over installed package
+_worktree_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _worktree_root not in sys.path:
+    sys.path.insert(0, _worktree_root)
+# Force reimport from worktree if already cached from installed package
+if "main" in sys.modules:
+    del sys.modules["main"]
+
 # NOW it's safe to import main
 import main
 
