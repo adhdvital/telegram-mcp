@@ -60,8 +60,13 @@ exclude = [
     "docs/source/conf.py",
 ]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [dependency-groups]
 dev = [
     "black>=25.9.0",
     "flake8>=7.3.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
 ]
