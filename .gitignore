@@ -187,9 +187,11 @@ anon_new.session-journal
 claude_desktop_config.json
 .DS_Store
 
+# Worktrees
+.worktrees/
+
 # Test files
 .cursor/
-tests/
 test.py
 extract_test_issues.py
 *.tmp
