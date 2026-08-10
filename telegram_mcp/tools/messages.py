@@ -1,5 +1,7 @@
 """Messages MCP tools."""
 
+import secrets
+
 from telegram_mcp.runtime import *
 
 # Domain used to build message permalinks. Overridable because the default is a
@@ -7,6 +9,59 @@ from telegram_mcp.runtime import *
 # over an OFAC listing and every t.me link on earth broke for about a day, while
 # telegram.me kept resolving. The domain has been ACTIVE again since 2026-07-14.
 LINK_DOMAIN = os.getenv("TELEGRAM_LINK_DOMAIN", "t.me")
+
+
+_DELETE_OWN_PREVIEW_TTL_SECONDS = 15 * 60
+_DELETE_OWN_BATCH_SIZE = 100
+_delete_own_previews: Dict[str, dict] = {}
+
+
+def _delete_own_chat_title(entity: Any) -> str:
+    raw = getattr(entity, "title", None) or " ".join(
+        part
+        for part in (getattr(entity, "first_name", None), getattr(entity, "last_name", None))
+        if part
+    )
+    return sanitize_name(raw or str(get_marked_id(entity))).replace("\n", " ").strip()
+
+
+def _is_group_entity(entity: Any) -> bool:
+    return isinstance(entity, Chat) or (
+        isinstance(entity, Channel) and bool(getattr(entity, "megagroup", False))
+    )
+
+
+def _delete_own_confirmation(*, title: str, chat_id: int, message_count: int, token: str) -> str:
+    return (
+        f'DELETE FOR EVERYONE | chat="{title}" | chat_id={chat_id} | '
+        f"own_messages={message_count} | token={token}"
+    )
+
+
+async def _collect_own_messages(cl: Any, entity: Any, own_user_id: int) -> list[Any]:
+    messages = []
+    async for message in cl.iter_messages(entity, from_user=own_user_id):
+        if getattr(message, "sender_id", None) == own_user_id:
+            messages.append(message)
+    return messages
+
+
+def _live_messages(messages: Any) -> list[Any]:
+    if messages is None:
+        return []
+    if not isinstance(messages, (list, tuple)):
+        messages = [messages]
+    return [
+        message
+        for message in messages
+        if message is not None and not isinstance(message, types.MessageEmpty)
+    ]
+
+
+async def _delete_message_ids_for_everyone(cl: Any, entity: Any, message_ids: list[int]) -> Any:
+    if isinstance(entity, Channel):
+        return await cl(functions.channels.DeleteMessagesRequest(channel=entity, id=message_ids))
+    return await cl(functions.messages.DeleteMessagesRequest(id=message_ids, revoke=True))
 
 
 def get_media_label(msg) -> str:
@@ -1227,6 +1282,267 @@ async def edit_message(
 
 @mcp.tool(
     annotations=ToolAnnotations(
+        title="Preview Delete Own Messages",
+        openWorldHint=True,
+        readOnlyHint=True,
+        idempotentHint=False,
+    )
+)
+@with_account(readonly=True)
+@validate_id("chat_id")
+async def preview_delete_own_messages(chat_id: Union[int, str], account: str = None) -> str:
+    """Preview every message sent by the current account in one group.
+
+    This tool never deletes anything. It returns the exact chat, account, message
+    count, date range, and a one-time confirmation phrase required by
+    ``delete_own_messages_for_everyone``. The preview expires after 15 minutes
+    and becomes invalid if the matching message set changes.
+
+    Args:
+        chat_id: Exact basic-group or supergroup ID/username.
+    """
+    try:
+        cl = get_client(account)
+        await ensure_connected(cl)
+        entity = await resolve_entity(chat_id, cl)
+        if not _is_group_entity(entity):
+            return "Refused: this safety-scoped tool only supports Telegram groups."
+
+        me = await cl.get_me()
+        own_messages = await _collect_own_messages(cl, entity, me.id)
+        message_ids = [message.id for message in own_messages]
+        marked_chat_id = get_marked_id(entity)
+        title = _delete_own_chat_title(entity)
+        now = time.time()
+
+        for stale_token, preview in list(_delete_own_previews.items()):
+            if preview["created_at"] + _DELETE_OWN_PREVIEW_TTL_SECONDS < now:
+                _delete_own_previews.pop(stale_token, None)
+
+        token = secrets.token_urlsafe(8)
+        snapshot = hashlib.sha256(
+            f"{me.id}:{marked_chat_id}:{','.join(map(str, message_ids))}".encode()
+        ).hexdigest()[:16]
+        confirmation = _delete_own_confirmation(
+            title=title,
+            chat_id=marked_chat_id,
+            message_count=len(message_ids),
+            token=token,
+        )
+        dates = [message.date for message in own_messages if getattr(message, "date", None)]
+        preview = {
+            "token": token,
+            "confirmation": confirmation,
+            "created_at": now,
+            "status": "ready",
+            "lock": asyncio.Lock(),
+            "account": account,
+            "account_user_id": me.id,
+            "chat_id": marked_chat_id,
+            "chat_title": title,
+            "message_ids": message_ids,
+            "remaining_ids": list(message_ids),
+            "snapshot": snapshot,
+        }
+        _delete_own_previews[token] = preview
+
+        result = {
+            "status": "confirmation_required",
+            "scope": "only messages whose sender_id equals the current Telegram account",
+            "account_user_id": me.id,
+            "chat_id": marked_chat_id,
+            "chat_title": title,
+            "message_count": len(message_ids),
+            "oldest_message_at": min(dates).isoformat() if dates else None,
+            "newest_message_at": max(dates).isoformat() if dates else None,
+            "newest_message_ids": message_ids[:5],
+            "oldest_message_ids": message_ids[-5:],
+            "snapshot": snapshot,
+            "preview_token": token,
+            "expires_in_seconds": _DELETE_OWN_PREVIEW_TTL_SECONDS,
+            "confirmation_phrase": confirmation,
+            "next_step": (
+                "Show this complete preview and confirmation_phrase to the user. "
+                "Do not call the delete tool until the user sends the exact phrase back."
+            ),
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return log_and_format_error("preview_delete_own_messages", e, chat_id=chat_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Delete Own Messages For Everyone",
+        openWorldHint=True,
+        destructiveHint=True,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def delete_own_messages_for_everyone(
+    chat_id: Union[int, str],
+    preview_token: str,
+    confirmation_phrase: str,
+    account: str = None,
+) -> str:
+    """Delete one confirmed snapshot of the current account's group messages.
+
+    Safety properties:
+    - requires a fresh preview and the user's exact confirmation phrase;
+    - refuses a changed message set before the first deletion;
+    - rechecks every message sender before deletion;
+    - uses Telegram's explicit ``revoke=True`` request for basic groups and the
+      server-wide channel deletion request for supergroups;
+    - deletes at most 100 messages per Telegram API request and verifies that
+      every confirmed ID is absent afterwards;
+    - never deletes messages created after the preview.
+
+    Repeating the same call resumes a partially completed deletion after a
+    transient API failure. A server restart invalidates the preview safely.
+
+    Args:
+        chat_id: The same exact group used for the preview.
+        preview_token: One-time token returned by ``preview_delete_own_messages``.
+        confirmation_phrase: Exact phrase returned by the preview and repeated by the user.
+    """
+    preview = _delete_own_previews.get(preview_token)
+    if preview is None:
+        return "Refused: preview token is missing or expired. Run the preview again."
+    if confirmation_phrase != preview["confirmation"]:
+        return "Refused: confirmation phrase does not exactly match the preview."
+
+    async with preview["lock"]:
+        try:
+            if preview["status"] == "complete":
+                return json.dumps(preview["result"], ensure_ascii=False, indent=2)
+            if (
+                preview["status"] == "ready"
+                and preview["created_at"] + _DELETE_OWN_PREVIEW_TTL_SECONDS < time.time()
+            ):
+                _delete_own_previews.pop(preview_token, None)
+                return "Refused: preview expired. Run the preview again."
+
+            cl = get_client(account)
+            await ensure_connected(cl)
+            entity = await resolve_entity(chat_id, cl)
+            marked_chat_id = get_marked_id(entity)
+            if not _is_group_entity(entity) or marked_chat_id != preview["chat_id"]:
+                return "Refused: resolved chat does not match the confirmed preview."
+
+            me = await cl.get_me()
+            if me.id != preview["account_user_id"]:
+                return "Refused: Telegram account does not match the confirmed preview."
+
+            if preview["status"] == "ready":
+                current = await _collect_own_messages(cl, entity, me.id)
+                current_ids = [message.id for message in current]
+                if current_ids != preview["message_ids"]:
+                    _delete_own_previews.pop(preview_token, None)
+                    return (
+                        "Refused: the set of your messages changed after preview. "
+                        "Run the preview again and confirm the new count."
+                    )
+                preview["status"] = "in_progress"
+
+            deleted_ids = set(preview["message_ids"]) - set(preview["remaining_ids"])
+            telegram_pts_count = 0
+            while preview["remaining_ids"]:
+                batch = preview["remaining_ids"][:_DELETE_OWN_BATCH_SIZE]
+                before = _live_messages(await cl.get_messages(entity, ids=batch))
+                wrong_sender = [
+                    message.id
+                    for message in before
+                    if getattr(message, "sender_id", None) != me.id
+                ]
+                if wrong_sender:
+                    return json.dumps(
+                        {
+                            "status": "refused_wrong_sender",
+                            "message_ids": wrong_sender,
+                            "deleted_so_far": len(deleted_ids),
+                            "remaining": len(preview["remaining_ids"]),
+                        },
+                        indent=2,
+                    )
+
+                existing_ids = [message.id for message in before]
+                missing_ids = set(batch) - set(existing_ids)
+                deleted_ids.update(missing_ids)
+                if existing_ids:
+                    response = await _delete_message_ids_for_everyone(cl, entity, existing_ids)
+                    telegram_pts_count += getattr(response, "pts_count", 0)
+                    await asyncio.sleep(0.25)
+                    survivors = _live_messages(await cl.get_messages(entity, ids=existing_ids))
+                    if survivors:
+                        return json.dumps(
+                            {
+                                "status": "verification_failed",
+                                "surviving_message_ids": [message.id for message in survivors],
+                                "deleted_so_far": len(deleted_ids),
+                                "remaining": len(preview["remaining_ids"]),
+                                "revoke_requested": True,
+                            },
+                            indent=2,
+                        )
+                    deleted_ids.update(existing_ids)
+
+                preview["remaining_ids"] = [
+                    message_id
+                    for message_id in preview["remaining_ids"]
+                    if message_id not in deleted_ids
+                ]
+
+            after = await _collect_own_messages(cl, entity, me.id)
+            confirmed_ids = set(preview["message_ids"])
+            surviving_confirmed_ids = [
+                message.id for message in after if message.id in confirmed_ids
+            ]
+            new_unconfirmed_ids = [
+                message.id for message in after if message.id not in confirmed_ids
+            ]
+            if surviving_confirmed_ids:
+                return json.dumps(
+                    {
+                        "status": "verification_failed",
+                        "surviving_message_ids": surviving_confirmed_ids,
+                        "revoke_requested": True,
+                    },
+                    indent=2,
+                )
+
+            result = {
+                "status": "complete",
+                "chat_id": preview["chat_id"],
+                "chat_title": preview["chat_title"],
+                "account_user_id": preview["account_user_id"],
+                "confirmed_messages_deleted": len(preview["message_ids"]),
+                "new_unconfirmed_messages_not_deleted": len(new_unconfirmed_ids),
+                "new_unconfirmed_message_ids": new_unconfirmed_ids,
+                "delete_scope": (
+                    "Telegram channels.DeleteMessages (server-wide)"
+                    if isinstance(entity, Channel)
+                    else "Telegram messages.DeleteMessages with revoke=True"
+                ),
+                "revoke_requested": True,
+                "confirmed_ids_absent_after_delete": True,
+                "telegram_pts_count": telegram_pts_count,
+            }
+            preview["status"] = "complete"
+            preview["result"] = result
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return log_and_format_error(
+                "delete_own_messages_for_everyone",
+                e,
+                chat_id=chat_id,
+                preview_token=preview_token,
+            )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
         title="Delete Message", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
@@ -2019,6 +2335,8 @@ __all__ = [
     "get_message_context",
     "forward_message",
     "edit_message",
+    "preview_delete_own_messages",
+    "delete_own_messages_for_everyone",
     "delete_message",
     "delete_chat_history",
     "delete_messages_bulk",

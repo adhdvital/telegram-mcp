@@ -64,6 +64,23 @@ Aliases live in `${XDG_STATE_HOME:-~/.local/state}/telegram-mcp/aliases.json` (o
 
 All tool results that include Telegram user-controlled content are sanitized and, where practical, returned as structured JSON.
 
+### Safe deletion of your own group messages
+
+`preview_delete_own_messages(chat_id)` creates a 15-minute, in-memory snapshot
+of messages whose `sender_id` equals the current account. It returns the exact
+chat, account, count, date range, token, and confirmation phrase without
+deleting anything.
+
+`delete_own_messages_for_everyone(chat_id, preview_token,
+confirmation_phrase)` accepts only that exact phrase, rejects snapshot drift,
+rechecks every sender, deletes in batches of 100, and verifies every confirmed
+ID afterwards. Basic groups use `messages.DeleteMessages(revoke=True)`;
+supergroups use server-wide `channels.DeleteMessages`. New messages created
+after the preview are never included. A server restart invalidates the token.
+
+Keep the generic `delete_message`, `delete_messages_bulk`, and
+`delete_chat_history` tools hidden when this narrower workflow is sufficient.
+
 ### Incoming Event Feed (callback mode, Claude Code only)
 
 By default, an agent waits for replies by calling `wait_for_settled_message`, which blocks up to the MCP tool timeout and must be re-called — that works everywhere (Codex, Cursor, etc.) and is unchanged.
