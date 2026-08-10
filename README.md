@@ -85,7 +85,16 @@ Keep the generic `delete_message`, `delete_messages_bulk`, and
 read-only audit. It reads Telegram's participant constructors to distinguish
 owner, admin, member, and absent users in both legacy basic groups and
 supergroups. It reports whether the current account can remove the exact target
-without performing or exposing any removal action.
+without performing any removal action.
+
+`preview_remove_member_from_owned_group(chat_id, target_user_id)` and
+`remove_member_from_owned_group(chat_id, target_user_id, preview_token,
+confirmation_phrase)` provide the matching guarded mutation. They work only
+when the current account is the group owner and the target is an ordinary
+member, never an owner or admin. The execute step rechecks both roles and IDs,
+kicks without a permanent ban, preserves message history, and verifies that the
+target is absent. Each preview token expires after 15 minutes and is invalidated
+by a server restart. Keep generic `ban_user` and admin tools hidden.
 
 ### Incoming Event Feed (callback mode, Claude Code only)
 

@@ -1,5 +1,7 @@
 """Groups MCP tools."""
 
+import secrets
+
 from telegram_mcp.runtime import *
 
 
@@ -973,6 +975,62 @@ async def _channel_participant(cl: Any, entity: Channel, user: Any) -> Any:
         return None
 
 
+_REMOVE_MEMBER_PREVIEW_TTL_SECONDS = 15 * 60
+_remove_member_previews: Dict[str, dict] = {}
+
+
+def _remove_member_label(value: Any, fallback: str) -> str:
+    return sanitize_name(value or fallback).replace("\n", " ").replace('"', "'").strip()
+
+
+def _remove_member_confirmation(
+    *, title: str, chat_id: int, target_name: str, target_user_id: int, token: str
+) -> str:
+    return (
+        f'REMOVE MEMBER | chat="{title}" | chat_id={chat_id} | '
+        f'user="{target_name}" | user_id={target_user_id} | token={token}'
+    )
+
+
+async def _remove_member_state(cl: Any, entity: Any, target: Any) -> dict:
+    me = await cl.get_me()
+    if isinstance(entity, Chat):
+        participants = await _basic_group_participants(cl, entity)
+        my_participant = participants.get(me.id)
+        target_participant = participants.get(target.id)
+    else:
+        my_participant, target_participant = await asyncio.gather(
+            _channel_participant(cl, entity, me),
+            _channel_participant(cl, entity, target),
+        )
+
+    title = _remove_member_label(getattr(entity, "title", None), str(get_marked_id(entity)))
+    target_name = _remove_member_label(
+        " ".join(
+            part
+            for part in (
+                getattr(target, "first_name", None),
+                getattr(target, "last_name", None),
+            )
+            if part
+        )
+        or getattr(target, "username", None),
+        str(target.id),
+    )
+    return {
+        "me": me,
+        "target": target,
+        "my_participant": my_participant,
+        "target_participant": target_participant,
+        "my_role": _participant_role(my_participant),
+        "target_role": _participant_role(target_participant),
+        "chat_id": get_marked_id(entity),
+        "chat_title": title,
+        "target_user_id": target.id,
+        "target_name": target_name,
+    }
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Check Member Removal Permissions",
@@ -1071,6 +1129,212 @@ async def check_member_removal_permissions(
             chat_id=chat_id,
             target_user_id=target_user_id,
         )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Preview Remove Member From Owned Group",
+        openWorldHint=True,
+        readOnlyHint=True,
+        idempotentHint=False,
+    )
+)
+@with_account(readonly=True)
+@validate_id("chat_id", "target_user_id")
+async def preview_remove_member_from_owned_group(
+    chat_id: Union[int, str],
+    target_user_id: Union[int, str],
+    account: str = None,
+) -> str:
+    """Preview removing one ordinary member from a group owned by this account.
+
+    The tool performs no mutation. It refuses groups where the current account
+    is not the owner and refuses targets who are owners or administrators.
+    A successful preview returns a one-time token and exact confirmation phrase.
+    """
+    try:
+        cl = get_client(account)
+        await ensure_connected(cl)
+        entity = await resolve_entity(chat_id, cl)
+        if not isinstance(entity, Chat) and not (
+            isinstance(entity, Channel) and getattr(entity, "megagroup", False)
+        ):
+            return "Refused: member removal only applies to Telegram groups."
+
+        target = await resolve_entity(target_user_id, cl)
+        state = await _remove_member_state(cl, entity, target)
+        if state["my_role"] != "owner":
+            return "Refused: the current Telegram account is not the group owner."
+        if state["target_role"] != "member":
+            return (
+                "Refused: the target must be a current ordinary member; "
+                f'observed role is {state["target_role"]}.'
+            )
+        if state["me"].id == state["target_user_id"]:
+            return "Refused: this tool cannot remove the current Telegram account."
+
+        now = time.time()
+        for stale_token, preview in list(_remove_member_previews.items()):
+            if preview["created_at"] + _REMOVE_MEMBER_PREVIEW_TTL_SECONDS < now:
+                _remove_member_previews.pop(stale_token, None)
+
+        token = secrets.token_urlsafe(8)
+        confirmation = _remove_member_confirmation(
+            title=state["chat_title"],
+            chat_id=state["chat_id"],
+            target_name=state["target_name"],
+            target_user_id=state["target_user_id"],
+            token=token,
+        )
+        _remove_member_previews[token] = {
+            "created_at": now,
+            "status": "ready",
+            "lock": asyncio.Lock(),
+            "account": account,
+            "account_user_id": state["me"].id,
+            "chat_id": state["chat_id"],
+            "chat_title": state["chat_title"],
+            "target_user_id": state["target_user_id"],
+            "target_name": state["target_name"],
+            "confirmation": confirmation,
+        }
+        return json.dumps(
+            {
+                "status": "confirmation_required",
+                "scope": "remove exactly one ordinary member from a group owned by this account",
+                "account_user_id": state["me"].id,
+                "chat_id": state["chat_id"],
+                "chat_title": state["chat_title"],
+                "target_user_id": state["target_user_id"],
+                "target_name": state["target_name"],
+                "target_role": state["target_role"],
+                "messages_will_be_deleted": False,
+                "permanent_ban": False,
+                "preview_token": token,
+                "expires_in_seconds": _REMOVE_MEMBER_PREVIEW_TTL_SECONDS,
+                "confirmation_phrase": confirmation,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        return log_and_format_error(
+            "preview_remove_member_from_owned_group",
+            e,
+            chat_id=chat_id,
+            target_user_id=target_user_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Remove Member From Owned Group",
+        openWorldHint=True,
+        destructiveHint=True,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id", "target_user_id")
+async def remove_member_from_owned_group(
+    chat_id: Union[int, str],
+    target_user_id: Union[int, str],
+    preview_token: str,
+    confirmation_phrase: str,
+    account: str = None,
+) -> str:
+    """Remove one confirmed ordinary member without permanently banning them.
+
+    The tool rechecks exact chat and target IDs, current ownership, and target
+    role immediately before mutation. It never removes owners or admins, never
+    deletes message history, and verifies that the target is no longer a member.
+    """
+    preview = _remove_member_previews.get(preview_token)
+    if preview is None:
+        return "Refused: preview token is missing or expired. Run the preview again."
+    if confirmation_phrase != preview["confirmation"]:
+        return "Refused: confirmation phrase does not exactly match the preview."
+
+    async with preview["lock"]:
+        try:
+            if preview["status"] == "complete":
+                return json.dumps(preview["result"], ensure_ascii=False, indent=2)
+            if preview["created_at"] + _REMOVE_MEMBER_PREVIEW_TTL_SECONDS < time.time():
+                _remove_member_previews.pop(preview_token, None)
+                return "Refused: preview expired. Run the preview again."
+
+            cl = get_client(account)
+            await ensure_connected(cl)
+            entity = await resolve_entity(chat_id, cl)
+            if not isinstance(entity, Chat) and not (
+                isinstance(entity, Channel) and getattr(entity, "megagroup", False)
+            ):
+                return "Refused: member removal only applies to Telegram groups."
+            target = await resolve_entity(target_user_id, cl)
+            state = await _remove_member_state(cl, entity, target)
+
+            if state["chat_id"] != preview["chat_id"]:
+                return "Refused: chat does not match the confirmed preview."
+            if state["target_user_id"] != preview["target_user_id"]:
+                return "Refused: target does not match the confirmed preview."
+            if state["me"].id != preview["account_user_id"]:
+                return "Refused: Telegram account does not match the confirmed preview."
+            if state["my_role"] != "owner":
+                return "Refused: current account is no longer the group owner."
+            if state["target_role"] != "member":
+                return (
+                    "Refused: target is no longer an ordinary member; "
+                    f'observed role is {state["target_role"]}.'
+                )
+
+            await cl.kick_participant(entity, target)
+            target_participant = None
+            for attempt in range(3):
+                if isinstance(entity, Chat):
+                    target_participant = (await _basic_group_participants(cl, entity)).get(
+                        target.id
+                    )
+                else:
+                    target_participant = await _channel_participant(cl, entity, target)
+                if _participant_role(target_participant) == "not_participant":
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+
+            target_absent = _participant_role(target_participant) == "not_participant"
+            permanently_banned = bool(
+                isinstance(target_participant, types.ChannelParticipantBanned)
+                and getattr(
+                    getattr(target_participant, "banned_rights", None),
+                    "view_messages",
+                    False,
+                )
+            )
+            result = {
+                "status": "complete" if target_absent and not permanently_banned else "error",
+                "chat_id": state["chat_id"],
+                "chat_title": state["chat_title"],
+                "account_user_id": state["me"].id,
+                "account_was_owner": True,
+                "target_user_id": state["target_user_id"],
+                "target_name": state["target_name"],
+                "target_was_ordinary_member": True,
+                "removed_from_group": target_absent,
+                "permanent_ban": permanently_banned,
+                "messages_deleted": False,
+                "verified_after_removal": target_absent and not permanently_banned,
+            }
+            if result["status"] == "complete":
+                preview["status"] = "complete"
+                preview["result"] = result
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return log_and_format_error(
+                "remove_member_from_owned_group",
+                e,
+                chat_id=chat_id,
+                target_user_id=target_user_id,
+            )
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Admins", openWorldHint=True, readOnlyHint=True))
@@ -1400,6 +1664,8 @@ __all__ = [
     "toggle_slow_mode",
     "edit_admin_rights",
     "check_member_removal_permissions",
+    "preview_remove_member_from_owned_group",
+    "remove_member_from_owned_group",
     "get_admins",
     "get_banned_users",
     "get_invite_link",
