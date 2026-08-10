@@ -910,6 +910,169 @@ async def edit_admin_rights(
         return log_and_format_error("edit_admin_rights", e, chat_id=chat_id, user_id=user_id)
 
 
+def _participant_role(participant: Any) -> str:
+    """Normalize Telegram participant constructors into a small permission model."""
+    if participant is None:
+        return "not_participant"
+    if isinstance(
+        participant,
+        (types.ChatParticipantCreator, types.ChannelParticipantCreator),
+    ):
+        return "owner"
+    if isinstance(
+        participant,
+        (types.ChatParticipantAdmin, types.ChannelParticipantAdmin),
+    ):
+        return "admin"
+    if isinstance(
+        participant,
+        (types.ChannelParticipantBanned, types.ChannelParticipantLeft),
+    ):
+        return "not_participant"
+    return "member"
+
+
+def _participant_can_ban(participant: Any, entity: Any) -> bool:
+    if _participant_role(participant) == "owner":
+        return True
+    rights = getattr(participant, "admin_rights", None) or getattr(entity, "admin_rights", None)
+    return bool(getattr(rights, "ban_users", False))
+
+
+def _can_remove_participant(
+    *, my_id: int, my_participant: Any, target_id: int, target_participant: Any, entity: Any
+) -> bool:
+    my_role = _participant_role(my_participant)
+    target_role = _participant_role(target_participant)
+    if target_id == my_id or target_role == "not_participant":
+        return False
+    if my_role == "owner":
+        return target_role != "owner"
+    if my_role == "admin" and _participant_can_ban(my_participant, entity):
+        # Telegram admins cannot safely be assumed removable by a peer admin.
+        return target_role == "member"
+    return False
+
+
+async def _basic_group_participants(cl: Any, entity: Chat) -> dict[int, Any]:
+    full = await cl(functions.messages.GetFullChatRequest(chat_id=entity.id))
+    container = getattr(getattr(full, "full_chat", None), "participants", None)
+    return {
+        participant.user_id: participant
+        for participant in getattr(container, "participants", []) or []
+    }
+
+
+async def _channel_participant(cl: Any, entity: Channel, user: Any) -> Any:
+    try:
+        result = await cl(
+            functions.channels.GetParticipantRequest(channel=entity, participant=user)
+        )
+        return result.participant
+    except telethon.errors.rpcerrorlist.UserNotParticipantError:
+        return None
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Check Member Removal Permissions",
+        openWorldHint=True,
+        readOnlyHint=True,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=True)
+@validate_id("chat_id", "target_user_id")
+async def check_member_removal_permissions(
+    chat_id: Union[int, str],
+    target_user_id: Union[int, str],
+    account: str = None,
+) -> str:
+    """Read current roles and whether this account can remove one group member.
+
+    The tool performs no mutation. It distinguishes owner, admin, member, and
+    not-participant using Telegram's participant constructors instead of the
+    ambiguous ``get_admins`` listing for legacy basic groups.
+
+    Args:
+        chat_id: Exact basic-group or supergroup ID/username.
+        target_user_id: Exact Telegram user ID/username to inspect.
+    """
+    try:
+        cl = get_client(account)
+        await ensure_connected(cl)
+        entity = await resolve_entity(chat_id, cl)
+        if not isinstance(entity, Chat) and not (
+            isinstance(entity, Channel) and getattr(entity, "megagroup", False)
+        ):
+            return "Refused: member removal permissions only apply to Telegram groups."
+
+        me = await cl.get_me()
+        target = await resolve_entity(target_user_id, cl)
+        target_id = target.id
+
+        if isinstance(entity, Chat):
+            participants = await _basic_group_participants(cl, entity)
+            my_participant = participants.get(me.id)
+            target_participant = participants.get(target_id)
+            permission_source = "messages.GetFullChat participant constructors"
+        else:
+            my_participant, target_participant = await asyncio.gather(
+                _channel_participant(cl, entity, me),
+                _channel_participant(cl, entity, target),
+            )
+            permission_source = "channels.GetParticipant participant constructors"
+
+        my_role = _participant_role(my_participant)
+        target_role = _participant_role(target_participant)
+        can_remove = _can_remove_participant(
+            my_id=me.id,
+            my_participant=my_participant,
+            target_id=target_id,
+            target_participant=target_participant,
+            entity=entity,
+        )
+        title = sanitize_name(getattr(entity, "title", str(get_marked_id(entity))))
+        target_name = sanitize_name(
+            " ".join(
+                part
+                for part in (
+                    getattr(target, "first_name", None),
+                    getattr(target, "last_name", None),
+                )
+                if part
+            )
+            or getattr(target, "username", None)
+            or str(target_id)
+        )
+
+        result = {
+            "chat_id": get_marked_id(entity),
+            "chat_title": title,
+            "chat_type": get_entity_type(entity),
+            "my_user_id": me.id,
+            "my_role": my_role,
+            "my_can_ban_users": _participant_can_ban(my_participant, entity),
+            "target_user_id": target_id,
+            "target_name": target_name,
+            "target_username": sanitize_name(getattr(target, "username", None) or "") or None,
+            "target_role": target_role,
+            "target_is_current_member": target_role != "not_participant",
+            "can_remove_target": can_remove,
+            "owner_and_can_remove_target": my_role == "owner" and can_remove,
+            "permission_source": permission_source,
+            "read_only": True,
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return log_and_format_error(
+            "check_member_removal_permissions",
+            e,
+            chat_id=chat_id,
+            target_user_id=target_user_id,
+        )
+
+
 @mcp.tool(annotations=ToolAnnotations(title="Get Admins", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
 @validate_id("chat_id")
@@ -1236,6 +1399,7 @@ __all__ = [
     "set_default_chat_permissions",
     "toggle_slow_mode",
     "edit_admin_rights",
+    "check_member_removal_permissions",
     "get_admins",
     "get_banned_users",
     "get_invite_link",

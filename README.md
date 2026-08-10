@@ -81,6 +81,12 @@ after the preview are never included. A server restart invalidates the token.
 Keep the generic `delete_message`, `delete_messages_bulk`, and
 `delete_chat_history` tools hidden when this narrower workflow is sufficient.
 
+`check_member_removal_permissions(chat_id, target_user_id)` is a separate
+read-only audit. It reads Telegram's participant constructors to distinguish
+owner, admin, member, and absent users in both legacy basic groups and
+supergroups. It reports whether the current account can remove the exact target
+without performing or exposing any removal action.
+
 ### Incoming Event Feed (callback mode, Claude Code only)
 
 By default, an agent waits for replies by calling `wait_for_settled_message`, which blocks up to the MCP tool timeout and must be re-called — that works everywhere (Codex, Cursor, etc.) and is unchanged.
