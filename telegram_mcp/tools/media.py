@@ -1,6 +1,19 @@
 """Media MCP tools."""
 
+import secrets
+
+from telethon import errors as _telegram_errors
+from telethon import events as _events
+
 from telegram_mcp.runtime import *
+
+
+TRANSCRIPTION_CACHE_TTL_SECONDS = 600
+TRANSCRIPTION_WAIT_TIMEOUT_SECONDS = 15
+_transcription_cache: Dict[str, dict] = {}
+_transcription_tokens_by_id: Dict[tuple[int, int], set[str]] = {}
+_transcription_waiters: Dict[str, Any] = {}
+_transcription_handler_clients: Dict[int, Any] = {}
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Send File", openWorldHint=True, destructiveHint=True))
@@ -281,6 +294,262 @@ async def get_media_info(chat_id: Union[int, str], message_id: int, account: str
         return log_and_format_error("get_media_info", e, chat_id=chat_id, message_id=message_id)
 
 
+def _transcription_json(payload: dict) -> str:
+    """Serialize a transcript response without persisting it."""
+    return json.dumps(payload, ensure_ascii=False, default=json_serializer)
+
+
+def _public_transcription_entry(entry: dict) -> dict:
+    """Return only user-facing fields from an in-memory cache entry."""
+    payload = {
+        "status": "pending" if entry["pending"] else "completed",
+        "pending": entry["pending"],
+        "transcription_id": entry["transcription_id"],
+        "text": entry["text"],
+        "media_type": entry["media_type"],
+        "chat_id": entry["chat_id"],
+        "message_id": entry["message_id"],
+    }
+    if entry.get("status_token"):
+        payload["status_token"] = entry["status_token"]
+    if entry.get("trial_remains_num") is not None:
+        payload["trial_remains_num"] = entry["trial_remains_num"]
+    if entry.get("trial_remains_until_date") is not None:
+        payload["trial_remains_until_date"] = entry["trial_remains_until_date"]
+    return payload
+
+
+def _expire_transcription_token(status_token: str) -> None:
+    """Delete one transcript when its ten-minute in-memory lifetime ends."""
+    entry = _transcription_cache.pop(status_token, None)
+    if entry is None:
+        return
+    cache_key = (entry["client_id"], entry["transcription_id"])
+    tokens = _transcription_tokens_by_id.get(cache_key)
+    if tokens is not None:
+        tokens.discard(status_token)
+        if not tokens:
+            del _transcription_tokens_by_id[cache_key]
+    waiter = _transcription_waiters.pop(status_token, None)
+    if waiter is not None and not waiter.done():
+        waiter.cancel()
+
+
+def _cleanup_transcription_cache() -> None:
+    """Remove expired transcript state and detach its pending waiters."""
+    now = time.monotonic()
+    expired_tokens = [
+        token for token, entry in _transcription_cache.items() if entry["expires_at"] <= now
+    ]
+    for token in expired_tokens:
+        _expire_transcription_token(token)
+
+
+async def _on_transcribed_audio(client_id: int, update) -> None:
+    """Apply Telegram updates using client and transcription ID as the only key."""
+    _cleanup_transcription_cache()
+    cache_key = (client_id, update.transcription_id)
+    status_tokens = tuple(_transcription_tokens_by_id.get(cache_key, ()))
+    if not status_tokens:
+        return
+
+    pending = bool(update.pending)
+    for status_token in status_tokens:
+        entry = _transcription_cache.get(status_token)
+        if entry is not None:
+            entry["text"] = sanitize_user_content(update.text)
+            entry["pending"] = pending
+    if pending:
+        return
+
+    _transcription_tokens_by_id.pop(cache_key, None)
+    for status_token in status_tokens:
+        waiter = _transcription_waiters.get(status_token)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
+
+def _ensure_transcription_handler(cl) -> None:
+    """Register one raw transcript-update handler per Telegram client."""
+    client_id = id(cl)
+    if client_id in _transcription_handler_clients:
+        return
+
+    async def handler(update):
+        await _on_transcribed_audio(client_id, update)
+
+    cl.add_event_handler(handler, _events.Raw(types.UpdateTranscribedAudio))
+    _transcription_handler_clients[client_id] = handler
+
+
+def _transcription_error_payload(error: Exception) -> dict:
+    """Map Telegram RPC failures to stable, user-facing error names."""
+    if isinstance(error, _telegram_errors.FloodWaitError):
+        return {
+            "status": "error",
+            "error": "rate_limited",
+            "retry_after_seconds": error.seconds,
+        }
+    if isinstance(error, _telegram_errors.PremiumAccountRequiredError):
+        return {"status": "error", "error": "transcription_not_entitled"}
+
+    error_name = error.__class__.__name__.upper()
+    error_message = str(getattr(error, "message", "") or error).upper()
+    error_key = f"{error_name} {error_message}"
+    mappings = {
+        "MSG_ID_INVALID": "message_not_found",
+        "PEER_ID_INVALID": "chat_not_found_or_unavailable",
+        "MSG_VOICE_MISSING": "unsupported_media_type",
+        "MSG_VOICE_TOO_LONG": "voice_too_long",
+        "PREMIUM_ACCOUNT_REQUIRED": "transcription_not_entitled",
+        "TRANSCRIPTION_FAILED": "transcription_failed",
+    }
+    for telegram_error, public_error in mappings.items():
+        if telegram_error in error_key:
+            return {"status": "error", "error": public_error}
+    return {"status": "error", "error": "telegram_rpc_or_transport_error"}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Transcribe Voice or Video Note",
+        openWorldHint=True,
+        readOnlyHint=False,
+        destructiveHint=False,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def transcribe_voice_or_video_note(
+    chat_id: Union[int, str],
+    message_id: int,
+    confirm_transcription: bool = False,
+    account: str = None,
+) -> str:
+    """
+    Transcribe one Telegram voice message or round video without downloading it.
+
+    Telegram may share only the selected message's audio data with Google LLC.
+    Set confirm_transcription=True only after the user explicitly asks to transcribe
+    or analyze this message, chat, or time period. That scoped request counts as
+    confirmation for matching media. Ordinary audio files and videos are unsupported.
+
+    Args:
+        chat_id: The chat ID or username containing the message.
+        message_id: The Telegram message ID.
+        confirm_transcription: Confirms scoped external transcription processing.
+    """
+    if not confirm_transcription:
+        return _transcription_json(
+            {
+                "status": "confirmation_required",
+                "warning": (
+                    "Telegram may share only this message's audio data with Google "
+                    "LLC for transcription. Ask for explicit consent scoped to this "
+                    "message, chat, or period, then call again with "
+                    "confirm_transcription=true."
+                ),
+            }
+        )
+
+    try:
+        _cleanup_transcription_cache()
+        cl = get_client(account)
+        await ensure_connected(cl)
+        _ensure_transcription_handler(cl)
+        peer = await resolve_input_entity(chat_id, cl)
+        message = await cl.get_messages(peer, ids=message_id)
+        if not message:
+            return _transcription_json({"status": "error", "error": "message_not_found"})
+
+        if message.voice:
+            media_type = "voice"
+        elif message.video_note:
+            media_type = "video_note"
+        else:
+            return _transcription_json(
+                {
+                    "status": "error",
+                    "error": "unsupported_media_type",
+                    "supported_media_types": ["voice", "video_note"],
+                }
+            )
+
+        result = await cl(functions.messages.TranscribeAudioRequest(peer=peer, msg_id=message_id))
+        transcription_id = result.transcription_id
+        client_id = id(cl)
+        entry = {
+            "pending": bool(result.pending),
+            "transcription_id": transcription_id,
+            "text": sanitize_user_content(result.text),
+            "media_type": media_type,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "client_id": client_id,
+            "trial_remains_num": getattr(result, "trial_remains_num", None),
+            "trial_remains_until_date": getattr(result, "trial_remains_until_date", None),
+            "expires_at": time.monotonic() + TRANSCRIPTION_CACHE_TTL_SECONDS,
+        }
+        if not entry["pending"]:
+            return _transcription_json(_public_transcription_entry(entry))
+
+        status_token = secrets.token_urlsafe(24)
+        entry["status_token"] = status_token
+        cache_key = (client_id, transcription_id)
+        waiter = asyncio.get_running_loop().create_future()
+        _transcription_cache[status_token] = entry
+        entry["expiry_handle"] = asyncio.get_running_loop().call_later(
+            TRANSCRIPTION_CACHE_TTL_SECONDS,
+            _expire_transcription_token,
+            status_token,
+        )
+        _transcription_waiters[status_token] = waiter
+        _transcription_tokens_by_id.setdefault(cache_key, set()).add(status_token)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(waiter),
+                timeout=TRANSCRIPTION_WAIT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            if _transcription_waiters.get(status_token) is waiter:
+                _transcription_waiters.pop(status_token, None)
+
+        return _transcription_json(_public_transcription_entry(entry))
+    except Exception as error:
+        logger.error(
+            "Telegram transcription failed for chat_id=%s message_id=%s error=%s",
+            chat_id,
+            message_id,
+            error.__class__.__name__,
+            exc_info=True,
+        )
+        return _transcription_json(_transcription_error_payload(error))
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get Media Transcription Status",
+        openWorldHint=False,
+        readOnlyHint=True,
+        destructiveHint=False,
+    )
+)
+async def get_media_transcription_status(status_token: str) -> str:
+    """Read an in-memory transcription status without making a Telegram request."""
+    _cleanup_transcription_cache()
+    entry = _transcription_cache.get(status_token)
+    if entry is None:
+        return _transcription_json(
+            {"status": "unknown", "error": "status_token_unknown_or_expired"}
+        )
+    return _transcription_json(_public_transcription_entry(entry))
+
+
 @mcp.tool(
     annotations=ToolAnnotations(title="Get Sticker Sets", openWorldHint=True, readOnlyHint=True)
 )
@@ -425,6 +694,8 @@ __all__ = [
     "send_voice",
     "upload_file",
     "get_media_info",
+    "transcribe_voice_or_video_note",
+    "get_media_transcription_status",
     "get_sticker_sets",
     "send_sticker",
     "get_gif_search",
